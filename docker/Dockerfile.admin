@@ -1,0 +1,20 @@
+FROM openjdk:8-jre-slim
+
+LABEL maintainer="lake-writer"
+LABEL description="Kafka Lake Writer Admin"
+
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+WORKDIR /app
+
+# Copy the fat jar (frontend static files are embedded inside)
+COPY lake-writer-admin/target/lake-writer-admin-*.jar app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", \
+  "-Xms256m", "-Xmx1g", \
+  "-XX:+UseG1GC", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

@@ -1,0 +1,99 @@
+server:
+  port: 8081   # only used by actuator
+
+spring:
+  application:
+    name: lake-writer-worker
+  # Worker runs no business web controllers, but needs a minimal servlet container
+  # for actuator endpoints (health, prometheus). Only management.server.port is exposed.
+  main:
+    web-application-type: servlet
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DB:lake_writer}?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 3       # worker only needs: config polling + heartbeat + recovery
+      minimum-idle: 1
+      connection-timeout: 10000
+  jpa:
+    hibernate:
+      ddl-auto: none             # schema managed by sql/init.sql
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+
+# ===== Kafka Consumer =====
+lake-writer:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    group-id: ${KAFKA_GROUP_ID:kafka-lake-writer}
+    consumer-count: ${CONSUMER_COUNT:4}
+    max-poll-records: 5000
+    fetch-min-bytes: 1048576      # 1MB — batch pull for throughput
+    fetch-max-wait-ms: 500
+    session-timeout-ms: 30000
+    heartbeat-interval-ms: 10000
+    max-poll-interval-ms: 300000  # 5min — must exceed max flush duration
+    auto-offset-reset: latest
+
+  # ===== Storage =====
+  storage:
+    type: ${STORAGE_TYPE:hdfs}    # hdfs | oss
+    hdfs:
+      default-fs: ${HDFS_URI:hdfs://namenode:8020}
+      config:
+        dfs.replication: "3"
+        dfs.client.block.write.replace-datanode-on-failure.enable: "true"
+    oss:
+      endpoint: ${OSS_ENDPOINT:}
+      access-key-id: ${OSS_ACCESS_KEY:}
+      access-key-secret: ${OSS_SECRET_KEY:}
+      bucket: ${OSS_BUCKET:}
+
+  # ===== Buffer =====
+  buffer:
+    max-total-bytes: 3221225472   # 3GB
+    flush-thread-pool-size: 4
+
+  # ===== Config sync =====
+  config:
+    sync-interval-sec: 30
+    version-align-delay-sec: 60
+
+  # ===== Heartbeat =====
+  heartbeat:
+    interval-sec: 15
+
+  # ===== Checkpoint =====
+  checkpoint:
+    dir: ${CHECKPOINT_DIR:./checkpoint}
+
+  # ===== Node identity =====
+  node:
+    id: ${POD_NAME:${HOSTNAME:}}
+
+# Actuator — expose health + prometheus only
+management:
+  server:
+    port: 8081
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      application: lake-writer-worker
+      node: ${POD_NAME:${HOSTNAME:unknown}}
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.lakewriter: INFO
+    org.apache.kafka: WARN
+    org.apache.hadoop: WARN
+    org.apache.parquet: WARN

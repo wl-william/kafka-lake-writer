@@ -1,0 +1,29 @@
+FROM openjdk:8-jre-slim
+
+LABEL maintainer="lake-writer"
+LABEL description="Kafka Lake Writer Worker"
+
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+WORKDIR /app
+
+# Copy the fat jar
+COPY lake-writer-worker/target/lake-writer-worker-*.jar app.jar
+
+# Checkpoint directory
+RUN mkdir -p /data/checkpoints
+VOLUME ["/data/checkpoints"]
+
+# Hadoop config directory (mount from host or ConfigMap in K8s)
+ENV HADOOP_CONF_DIR=/etc/hadoop/conf
+
+EXPOSE 8081
+
+ENTRYPOINT ["java", \
+  "-Xms512m", "-Xmx4g", \
+  "-XX:+UseG1GC", \
+  "-XX:MaxGCPauseMillis=200", \
+  "-Djava.net.preferIPv4Stack=true", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
