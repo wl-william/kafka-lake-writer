@@ -8,8 +8,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-# Copy the fat jar (frontend static files are embedded inside)
-COPY lake-writer-admin/target/lake-writer-admin-*.jar app.jar
+# Copy the fat jar (frontend static files are embedded inside, finalName = lake-writer-admin)
+COPY lake-writer-admin/target/lake-writer-admin.jar app.jar
 
 EXPOSE 8080
 

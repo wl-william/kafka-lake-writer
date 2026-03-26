@@ -8,6 +8,7 @@ import com.lakewriter.worker.consumer.KafkaConsumerPool;
 import com.lakewriter.worker.heartbeat.HeartbeatReporter;
 import com.lakewriter.worker.node.NodeIdentity;
 import com.lakewriter.worker.storage.HadoopStorageAdapter;
+import com.lakewriter.worker.storage.OssStorageAdapter;
 import com.lakewriter.worker.storage.StorageAdapter;
 import com.lakewriter.worker.writer.FlushExecutor;
 import lombok.extern.slf4j.Slf4j;
@@ -67,8 +68,23 @@ public class WorkerBeanConfig {
     private String autoOffsetReset;
 
     // ===== Storage =====
+    @Value("${lake-writer.storage.type:hdfs}")
+    private String storageType;
+
     @Value("${lake-writer.storage.hdfs.default-fs:hdfs://namenode:8020}")
     private String hdfsDefaultFs;
+
+    @Value("${lake-writer.storage.oss.endpoint:}")
+    private String ossEndpoint;
+
+    @Value("${lake-writer.storage.oss.access-key-id:}")
+    private String ossAccessKeyId;
+
+    @Value("${lake-writer.storage.oss.access-key-secret:}")
+    private String ossAccessKeySecret;
+
+    @Value("${lake-writer.storage.oss.bucket:}")
+    private String ossBucket;
 
     // ===== Buffer =====
     @Value("${lake-writer.buffer.max-total-bytes:3221225472}")
@@ -89,6 +105,11 @@ public class WorkerBeanConfig {
 
     @Bean
     public StorageAdapter storageAdapter() throws IOException {
+        if ("oss".equalsIgnoreCase(storageType)) {
+            log.info("StorageAdapter: using OSS (endpoint={}, bucket={})", ossEndpoint, ossBucket);
+            return new OssStorageAdapter(ossEndpoint, ossAccessKeyId, ossAccessKeySecret, ossBucket);
+        }
+        log.info("StorageAdapter: using HDFS (defaultFS={})", hdfsDefaultFs);
         Configuration hadoopConf = new Configuration();
         hadoopConf.set("dfs.replication", "3");
         hadoopConf.set("dfs.client.block.write.replace-datanode-on-failure.enable", "true");

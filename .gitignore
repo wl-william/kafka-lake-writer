@@ -1,0 +1,26 @@
+# Maven
+target/
+*.jar
+!.mvn/wrapper/*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+node_modules/
+node/
+
+# Spring Boot
+*.log
+
+# Checkpoint (local dev)
+checkpoint/

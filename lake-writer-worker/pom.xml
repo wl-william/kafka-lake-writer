@@ -21,10 +21,11 @@
             <artifactId>lake-writer-common</artifactId>
         </dependency>
 
-        <!-- Spring Boot (no web - actuator only) -->
+        <!-- Spring Boot Web (minimal — worker has no business controllers,
+             only needed for actuator HTTP endpoints on management port) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter</artifactId>
+            <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -51,6 +52,12 @@
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-client</artifactId>
+        </dependency>
+
+        <!-- OSS support via Hadoop FileSystem SPI (fs.oss.impl = AliyunOSSFileSystem) -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-aliyun</artifactId>
         </dependency>
 
         <!-- JSON -->
@@ -87,11 +94,14 @@
     </dependencies>
 
     <build>
+        <!-- Fixed jar name for Dockerfile COPY -->
+        <finalName>lake-writer-worker</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
+                    <mainClass>com.lakewriter.worker.WorkerApplication</mainClass>
                     <excludes>
                         <exclude>
                             <groupId>org.projectlombok</groupId>
@@ -99,6 +109,13 @@
                         </exclude>
                     </excludes>
                 </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

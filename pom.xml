@@ -109,6 +109,23 @@
                 <artifactId>mysql-connector-java</artifactId>
                 <version>${mysql.version}</version>
             </dependency>
+
+            <!-- Aliyun OSS Hadoop connector (Method A: Hadoop FileSystem SPI for oss://) -->
+            <dependency>
+                <groupId>org.apache.hadoop</groupId>
+                <artifactId>hadoop-aliyun</artifactId>
+                <version>3.0.0</version>
+                <exclusions>
+                    <exclusion>
+                        <groupId>org.slf4j</groupId>
+                        <artifactId>slf4j-log4j12</artifactId>
+                    </exclusion>
+                    <exclusion>
+                        <groupId>log4j</groupId>
+                        <artifactId>log4j</artifactId>
+                    </exclusion>
+                </exclusions>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -127,4 +144,25 @@
             </plugins>
         </pluginManagement>
     </build>
+
+    <!-- ===== Profiles for independent module packaging ===== -->
+    <profiles>
+        <!-- Build only the Worker fat jar: mvn clean package -pl lake-writer-worker -am -P worker -->
+        <profile>
+            <id>worker</id>
+            <modules>
+                <module>lake-writer-common</module>
+                <module>lake-writer-worker</module>
+            </modules>
+        </profile>
+
+        <!-- Build only the Admin fat jar: mvn clean package -pl lake-writer-admin -am -P admin -->
+        <profile>
+            <id>admin</id>
+            <modules>
+                <module>lake-writer-common</module>
+                <module>lake-writer-admin</module>
+            </modules>
+        </profile>
+    </profiles>
 </project>

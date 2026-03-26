@@ -77,7 +77,15 @@ services:
       MYSQL_PASSWORD: root
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_GROUP_ID: lake-writer-worker
+      # Storage backend: hdfs (default) or oss
+      STORAGE_TYPE: hdfs
       HDFS_URI: hdfs://namenode:8020
+      # --- Uncomment below to switch to OSS ---
+      # STORAGE_TYPE: oss
+      # OSS_ENDPOINT: oss-cn-hangzhou.aliyuncs.com
+      # OSS_ACCESS_KEY: <your-access-key-id>
+      # OSS_SECRET_KEY: <your-access-key-secret>
+      # OSS_BUCKET: <your-bucket-name>
       NODE_ID: worker-1
       CHECKPOINT_DIR: /data/checkpoints
     volumes:

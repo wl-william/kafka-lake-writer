@@ -8,8 +8,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-# Copy the fat jar
-COPY lake-writer-worker/target/lake-writer-worker-*.jar app.jar
+# Copy the fat jar (finalName = lake-writer-worker in pom.xml)
+COPY lake-writer-worker/target/lake-writer-worker.jar app.jar
 
 # Checkpoint directory
 RUN mkdir -p /data/checkpoints
