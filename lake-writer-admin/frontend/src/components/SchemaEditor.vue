@@ -2,24 +2,24 @@
   <div>
     <el-table :data="fields" border size="small" style="margin-bottom: 10px;">
       <el-table-column label="字段名" min-width="140">
-        <template slot-scope="{row, $index}">
+        <template slot-scope="{$index}">
           <el-input v-model="fields[$index].name" size="mini" placeholder="field_name" @input="emit" />
         </template>
       </el-table-column>
       <el-table-column label="类型" width="120">
-        <template slot-scope="{row, $index}">
+        <template slot-scope="{$index}">
           <el-select v-model="fields[$index].type" size="mini" @change="emit">
             <el-option v-for="t in typeOptions" :key="t" :label="t" :value="t" />
           </el-select>
         </template>
       </el-table-column>
       <el-table-column label="可空" width="70">
-        <template slot-scope="{row, $index}">
+        <template slot-scope="{$index}">
           <el-checkbox v-model="fields[$index].nullable" @change="emit" />
         </template>
       </el-table-column>
       <el-table-column label="操作" width="120">
-        <template slot-scope="{row, $index}">
+        <template slot-scope="{$index}">
           <el-button size="mini" :disabled="$index === 0" icon="el-icon-top" circle @click="moveUp($index)" />
           <el-button size="mini" :disabled="$index === fields.length - 1" icon="el-icon-bottom" circle @click="moveDown($index)" />
           <el-button size="mini" type="danger" icon="el-icon-delete" circle @click="remove($index)" />

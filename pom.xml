@@ -29,20 +29,11 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <kafka.version>2.8.2</kafka.version>
         <parquet.version>1.12.3</parquet.version>
-        <hadoop.version>3.0.0-cdh6.3.1</hadoop.version>
+        <hadoop.version>3.3.4</hadoop.version>
         <fastjson2.version>2.0.49</fastjson2.version>
         <commons-csv.version>1.10.0</commons-csv.version>
         <mysql.version>8.0.33</mysql.version>
     </properties>
-
-    <repositories>
-        <repository>
-            <id>cloudera</id>
-            <url>https://repository.cloudera.com/artifactory/cloudera-repos/</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
-        </repository>
-    </repositories>
 
     <dependencyManagement>
         <dependencies>
@@ -72,7 +63,7 @@
                 <version>${parquet.version}</version>
             </dependency>
 
-            <!-- Hadoop CDH6 -->
+            <!-- Hadoop Apache 3.3.4 (Apache 官方版, Aliyun 镜像可下载) -->
             <dependency>
                 <groupId>org.apache.hadoop</groupId>
                 <artifactId>hadoop-client</artifactId>
@@ -114,7 +105,7 @@
             <dependency>
                 <groupId>org.apache.hadoop</groupId>
                 <artifactId>hadoop-aliyun</artifactId>
-                <version>3.0.0</version>
+                <version>${hadoop.version}</version>
                 <exclusions>
                     <exclusion>
                         <groupId>org.slf4j</groupId>

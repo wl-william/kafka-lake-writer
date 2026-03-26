@@ -48,7 +48,7 @@
             <artifactId>parquet-avro</artifactId>
         </dependency>
 
-        <!-- Hadoop CDH6 -->
+        <!-- Hadoop (Apache 3.3.4, compatible with CDH6 clusters at runtime) -->
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-client</artifactId>

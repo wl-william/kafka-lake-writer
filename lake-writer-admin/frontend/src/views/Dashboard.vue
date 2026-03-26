@@ -50,7 +50,7 @@
 import { getStatusSummary } from '../api/status'
 
 export default {
-  name: 'Dashboard',
+  name: 'AppDashboard',
   filters: {
     datetime(val) {
       if (!val) return '-'
