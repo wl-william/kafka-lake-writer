@@ -18,6 +18,6 @@ public class FileWriterFactory {
         if ("CSV".equalsIgnoreCase(config.getSinkFormat())) {
             return new CsvFileWriter(storage);
         }
-        return new ParquetFileWriter();
+        return new ParquetFileWriter(storage);
     }
 }

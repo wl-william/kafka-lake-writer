@@ -29,29 +29,35 @@ public class RecordDispatcher {
     }
 
     public void dispatch(ConsumerRecord<String, String> record) {
-        String topic = record.topic();
-        TopicSinkConfig config = topicMatcher.match(topic);
-        if (config == null) {
-            log.debug("No config for topic {}, skipping record", topic);
-            return;
+        try {
+            String topic = record.topic();
+            TopicSinkConfig config = topicMatcher.match(topic);
+            if (config == null) {
+                log.debug("No config for topic {}, skipping record", topic);
+                return;
+            }
+
+            TopicPartition tp = new TopicPartition(topic, record.partition());
+            DoubleWriteBuffer buf = bufferManager.getBuffer(tp);
+            if (buf == null) {
+                // Buffer may not exist yet if partition was just assigned — create lazily
+                bufferManager.createBuffer(tp, config);
+                buf = bufferManager.getBuffer(tp);
+            }
+
+            FieldDef[] schema = config.getFieldArray();
+            Object[] row = parser.parseToRow(record.value(), schema);
+            if (row == null) return;   // parse error — already logged/metered in parser
+
+            // Records polled from Kafka MUST be appended to the buffer (At-Least-Once guarantee).
+            // Backpressure is enforced at the poll() level in ConsumerWorker, not here.
+            long estimatedBytes = record.serializedValueSize();
+            bufferManager.getBackpressure().add(estimatedBytes);
+            buf.append(row, record.offset(), estimatedBytes, record.timestamp());
+        } catch (Exception e) {
+            // Catch-all: never let a single bad record block consumption
+            log.warn("Dispatch error at topic={} partition={} offset={}: {}",
+                record.topic(), record.partition(), record.offset(), e.getMessage());
         }
-
-        TopicPartition tp = new TopicPartition(topic, record.partition());
-        DoubleWriteBuffer buf = bufferManager.getBuffer(tp);
-        if (buf == null) {
-            // Buffer may not exist yet if partition was just assigned — create lazily
-            bufferManager.createBuffer(tp, config);
-            buf = bufferManager.getBuffer(tp);
-        }
-
-        FieldDef[] schema = config.getFieldArray();
-        Object[] row = parser.parseToRow(record.value(), schema);
-        if (row == null) return;   // parse error — already logged/metered
-
-        // Records polled from Kafka MUST be appended to the buffer (At-Least-Once guarantee).
-        // Backpressure is enforced at the poll() level in ConsumerWorker, not here.
-        long estimatedBytes = record.serializedValueSize();
-        bufferManager.getBackpressure().add(estimatedBytes);
-        buf.append(row, record.offset(), estimatedBytes);
     }
 }

@@ -26,7 +26,7 @@ public class CheckpointManager {
     }
 
     public void save(Checkpoint ckpt) throws IOException {
-        File dir = new File(checkpointBaseDir, ckpt.getTopic());
+        File dir = new File(checkpointBaseDir, sanitizeTopic(ckpt.getTopic()));
         dir.mkdirs();
         File file = new File(dir, ckpt.getPartition() + ".ckpt");
         try (FileWriter fw = new FileWriter(file)) {
@@ -80,6 +80,15 @@ public class CheckpointManager {
     }
 
     private File ckptFile(TopicPartition tp) {
-        return new File(new File(checkpointBaseDir, tp.topic()), tp.partition() + ".ckpt");
+        return new File(new File(checkpointBaseDir, sanitizeTopic(tp.topic())), tp.partition() + ".ckpt");
+    }
+
+    /**
+     * Sanitize topic name for safe use as a directory component.
+     * Replaces path separators and ".." to prevent directory traversal.
+     */
+    private static String sanitizeTopic(String topic) {
+        if (topic == null) return "unknown";
+        return topic.replace('/', '_').replace('\\', '_').replace("..", "__");
     }
 }

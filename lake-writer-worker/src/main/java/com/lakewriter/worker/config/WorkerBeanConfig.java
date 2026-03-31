@@ -1,15 +1,16 @@
 package com.lakewriter.worker.config;
 
 import com.lakewriter.worker.buffer.WriteBufferManager;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
 import com.lakewriter.worker.checkpoint.CrashRecoveryManager;
 import com.lakewriter.worker.checkpoint.IdempotentWriteChecker;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.consumer.KafkaConsumerPool;
 import com.lakewriter.worker.heartbeat.HeartbeatReporter;
 import com.lakewriter.worker.node.NodeIdentity;
 import com.lakewriter.worker.storage.HadoopStorageAdapter;
 import com.lakewriter.worker.storage.OssStorageAdapter;
 import com.lakewriter.worker.storage.StorageAdapter;
+import com.lakewriter.worker.storage.StorageHealthChecker;
 import com.lakewriter.worker.writer.FlushExecutor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
@@ -91,16 +92,29 @@ public class WorkerBeanConfig {
     private long maxTotalBytes;
 
     // ===== Checkpoint =====
-    @Value("${lake-writer.checkpoint.dir:./checkpoint}")
-    private String checkpointDir;
+    @Value("${lake-writer.checkpoint.remote-dir}")
+    private String remoteCheckpointDir;
 
     // ===== Node identity =====
     @Value("${lake-writer.node.id:}")
     private String configuredNodeId;
 
+    // ===== Storage health probe =====
+    @Value("${lake-writer.storage.probe-interval-sec:30}")
+    private int storageProbeIntervalSec;
+
+    @Value("${lake-writer.storage.probe-path:/}")
+    private String storageProbePath;
+
     @Bean
     public NodeIdentity nodeIdentity() {
         return new NodeIdentity(configuredNodeId);
+    }
+
+    @Bean
+    public RemoteCheckpointManager remoteCheckpointManager(StorageAdapter storageAdapter) {
+        log.info("RemoteCheckpointManager: remote-dir={}", remoteCheckpointDir);
+        return new RemoteCheckpointManager(storageAdapter, remoteCheckpointDir);
     }
 
     @Bean
@@ -117,14 +131,9 @@ public class WorkerBeanConfig {
     }
 
     @Bean
-    public CheckpointManager checkpointManager() {
-        return new CheckpointManager(checkpointDir);
-    }
-
-    @Bean
-    public CrashRecoveryManager crashRecoveryManager(CheckpointManager checkpointManager,
+    public CrashRecoveryManager crashRecoveryManager(RemoteCheckpointManager remoteCheckpointManager,
                                                       StorageAdapter storageAdapter) {
-        return new CrashRecoveryManager(checkpointManager, storageAdapter);
+        return new CrashRecoveryManager(remoteCheckpointManager, storageAdapter);
     }
 
     @Bean
@@ -133,10 +142,16 @@ public class WorkerBeanConfig {
     }
 
     @Bean
+    public StorageHealthChecker storageHealthChecker(StorageAdapter storageAdapter) {
+        log.info("StorageHealthChecker: probe-path={}, interval={}s", storageProbePath, storageProbeIntervalSec);
+        return new StorageHealthChecker(storageAdapter, storageProbePath, storageProbeIntervalSec * 1000L);
+    }
+
+    @Bean
     public FlushExecutor flushExecutor(StorageAdapter storageAdapter,
-                                        CheckpointManager checkpointManager,
+                                        RemoteCheckpointManager remoteCheckpointManager,
                                         IdempotentWriteChecker idempotentWriteChecker) {
-        return new FlushExecutor(storageAdapter, checkpointManager, idempotentWriteChecker);
+        return new FlushExecutor(storageAdapter, remoteCheckpointManager, idempotentWriteChecker);
     }
 
     @Bean
@@ -154,11 +169,14 @@ public class WorkerBeanConfig {
                                                 FlushExecutor flushExecutor,
                                                 TopicMatcher topicMatcher,
                                                 NodeIdentity nodeIdentity,
-                                                CheckpointManager checkpointManager,
-                                                CrashRecoveryManager crashRecoveryManager) {
+                                                RemoteCheckpointManager remoteCheckpointManager,
+                                                CrashRecoveryManager crashRecoveryManager,
+                                                IdempotentWriteChecker idempotentWriteChecker,
+                                                StorageHealthChecker storageHealthChecker) {
         Properties kafkaProps = buildKafkaProperties();
         return new KafkaConsumerPool(kafkaProps, consumerCount, writeBufferManager,
-            flushExecutor, topicMatcher, nodeIdentity, checkpointManager, crashRecoveryManager);
+            flushExecutor, topicMatcher, nodeIdentity, remoteCheckpointManager, crashRecoveryManager,
+            idempotentWriteChecker, storageHealthChecker);
     }
 
     /**

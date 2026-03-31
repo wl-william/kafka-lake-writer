@@ -11,7 +11,7 @@ WORKDIR /app
 # Copy the fat jar (frontend static files are embedded inside, finalName = lake-writer-admin)
 COPY lake-writer-admin/target/lake-writer-admin.jar app.jar
 
-EXPOSE 8080
+EXPOSE 9080
 
 ENTRYPOINT ["java", \
   "-Xms256m", "-Xmx1g", \

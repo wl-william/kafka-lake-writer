@@ -1,6 +1,7 @@
 package com.lakewriter.worker.storage;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
 
@@ -12,6 +13,9 @@ public interface StorageAdapter extends AutoCloseable {
 
     /** Open a writable output stream at path (creates parent dirs automatically) */
     OutputStream create(String path) throws IOException;
+
+    /** Open a readable input stream at path */
+    InputStream read(String path) throws IOException;
 
     /** Atomic rename — HDFS rename is atomic within a filesystem */
     boolean rename(String srcPath, String dstPath) throws IOException;

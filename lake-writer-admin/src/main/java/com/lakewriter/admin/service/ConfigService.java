@@ -11,6 +11,9 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+
 import java.util.Date;
 import java.util.List;
 
@@ -119,10 +122,15 @@ public class ConfigService {
         log.setConfigId(config.getId());
         log.setTopicName(config.getTopicName());
         log.setChangeType(type);
-        log.setOperator("admin");
+        log.setOperator(currentUsername());
         log.setBeforeJson(before);
         log.setAfterJson(after);
         log.setCreatedAt(new Date());
         changeLogRepo.save(log);
+    }
+
+    private String currentUsername() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        return (auth != null && auth.getName() != null) ? auth.getName() : "system";
     }
 }

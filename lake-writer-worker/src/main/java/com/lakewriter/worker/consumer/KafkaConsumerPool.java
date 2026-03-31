@@ -1,11 +1,13 @@
 package com.lakewriter.worker.consumer;
 
 import com.lakewriter.worker.buffer.WriteBufferManager;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
 import com.lakewriter.worker.checkpoint.CrashRecoveryManager;
+import com.lakewriter.worker.checkpoint.IdempotentWriteChecker;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.config.TopicMatcher;
 import com.lakewriter.worker.node.NodeIdentity;
 import com.lakewriter.worker.schema.JsonRecordParser;
+import com.lakewriter.worker.storage.StorageHealthChecker;
 import com.lakewriter.worker.writer.FlushExecutor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -13,6 +15,7 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -30,6 +33,15 @@ public class KafkaConsumerPool {
 
     private final List<KafkaConsumer<String, String>> consumers = new ArrayList<>();
     private final List<ConsumerWorker> workers = new ArrayList<>();
+
+    /**
+     * Thread-safe assignment cache — updated by SafeRebalanceListener on the consumer thread,
+     * read by HeartbeatReporter on the scheduling thread.
+     * Never call KafkaConsumer.assignment() from outside the consumer thread.
+     */
+    private final Set<TopicPartition> assignmentCache =
+        Collections.newSetFromMap(new ConcurrentHashMap<>());
+
     private ExecutorService consumerPool;
     private ExecutorService flushPool;
     private final Properties kafkaProps;
@@ -38,23 +50,29 @@ public class KafkaConsumerPool {
     private final FlushExecutor flushExecutor;
     private final TopicMatcher topicMatcher;
     private final NodeIdentity nodeIdentity;
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final CrashRecoveryManager recoveryMgr;
+    private final IdempotentWriteChecker idempotentChecker;
+    private final StorageHealthChecker storageHealthChecker;
     private final JsonRecordParser parser;
 
     public KafkaConsumerPool(Properties kafkaProps, int consumerCount,
                               WriteBufferManager bufferManager, FlushExecutor flushExecutor,
                               TopicMatcher topicMatcher, NodeIdentity nodeIdentity,
-                              CheckpointManager checkpointMgr, CrashRecoveryManager recoveryMgr) {
-        this.kafkaProps = kafkaProps;
-        this.consumerCount = consumerCount;
-        this.bufferManager = bufferManager;
-        this.flushExecutor = flushExecutor;
-        this.topicMatcher  = topicMatcher;
-        this.nodeIdentity  = nodeIdentity;
-        this.checkpointMgr = checkpointMgr;
-        this.recoveryMgr   = recoveryMgr;
-        this.parser        = new JsonRecordParser();
+                              RemoteCheckpointManager checkpointMgr, CrashRecoveryManager recoveryMgr,
+                              IdempotentWriteChecker idempotentChecker,
+                              StorageHealthChecker storageHealthChecker) {
+        this.kafkaProps           = kafkaProps;
+        this.consumerCount        = consumerCount;
+        this.bufferManager        = bufferManager;
+        this.flushExecutor        = flushExecutor;
+        this.topicMatcher         = topicMatcher;
+        this.nodeIdentity         = nodeIdentity;
+        this.checkpointMgr        = checkpointMgr;
+        this.recoveryMgr          = recoveryMgr;
+        this.idempotentChecker    = idempotentChecker;
+        this.storageHealthChecker = storageHealthChecker;
+        this.parser               = new JsonRecordParser();
     }
 
     public void start(Set<String> topicsToSubscribe) {
@@ -73,14 +91,14 @@ public class KafkaConsumerPool {
             RecordDispatcher dispatcher = new RecordDispatcher(bufferManager, topicMatcher, parser);
 
             SafeRebalanceListener rebalanceListener = new SafeRebalanceListener(
-                bufferManager, checkpointMgr, recoveryMgr, flushExecutor,
-                topicMatcher, nodeIdentity, consumer);
+                bufferManager, checkpointMgr, recoveryMgr, idempotentChecker,
+                flushExecutor, topicMatcher, nodeIdentity, consumer, this);
 
             consumer.subscribe(topicsToSubscribe, rebalanceListener);
 
             ConsumerWorker worker = new ConsumerWorker(
                 consumer, dispatcher, bufferManager, flushExecutor,
-                topicMatcher, nodeIdentity, checkpointMgr, flushPool);
+                topicMatcher, nodeIdentity, checkpointMgr, flushPool, storageHealthChecker);
 
             consumers.add(consumer);
             workers.add(worker);
@@ -100,10 +118,23 @@ public class KafkaConsumerPool {
         });
     }
 
+    /**
+     * Returns a snapshot of currently assigned partitions.
+     * Safe to call from any thread — reads from ConcurrentHashMap cache,
+     * never touches KafkaConsumer directly.
+     */
     public Set<TopicPartition> getAssignedPartitions() {
-        Set<TopicPartition> all = new HashSet<>();
-        consumers.forEach(c -> all.addAll(c.assignment()));
-        return all;
+        return new HashSet<>(assignmentCache);
+    }
+
+    /** Called by SafeRebalanceListener.onPartitionsAssigned() on the consumer thread. */
+    void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+        assignmentCache.addAll(partitions);
+    }
+
+    /** Called by SafeRebalanceListener.onPartitionsRevoked() on the consumer thread. */
+    void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+        assignmentCache.removeAll(partitions);
     }
 
     public void close() {

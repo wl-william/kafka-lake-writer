@@ -44,7 +44,7 @@
 │  │  │ Kafka Consumer Pool        │   │                                    │
 │  │  │ → Write Buffer             │   │                                    │
 │  │  │ → File Writer              │   │   ┌─────────────────────────────┐ │
-│  │  │ → Checkpoint Manager       │   │   │       HDFS / OSS            │ │
+│  │  │ → RemoteCheckpointManager  │   │   │       HDFS / OSS            │ │
 │  │  │                            ├───┼──►│                             │ │
 │  │  └────────────────────────────┘   │   └─────────────────────────────┘ │
 │  └────────────────────────────────────┘                                    │
@@ -117,14 +117,15 @@
 - 使用临时文件 + rename的两阶段写入，保证原子性
 - 写入失败自动重试（最多3次，指数退避）
 
-### 2.5 容错层 (Checkpoint Manager)
+### 2.5 容错层 (RemoteCheckpointManager + StorageHealthChecker)
 
-**职责：** 管理checkpoint文件，支持crash后自动恢复。
+**职责：** 管理checkpoint文件，支持crash后跨节点自动恢复；检测存储可用性，保护数据不丢失。
 
-- 每次flush前在本地磁盘写入checkpoint
-- flush完成 + offset提交后删除checkpoint
-- 进程启动时扫描checkpoint目录，执行恢复逻辑
-- 清理HDFS/OSS上的残留临时文件
+- 每次flush的Phase 2将checkpoint写入**HDFS/OSS共享存储**（`{remoteBaseDir}/{topic}/P{n}.ckpt`）
+- checkpoint内容：`{topic, partition, offsetRange, tmpFilePath, targetFilePath, nodeId}`
+- flush完成 + offset提交（Phase 4）后删除远端checkpoint（Phase 5）
+- 恢复触发点：`onPartitionsAssigned()`回调，确保跨节点接管时也能读取checkpoint
+- `StorageHealthChecker`在consumer线程poll循环中按30秒间隔探测存储可用性；存储恢复后自动resume已暂停的分区
 
 ### 2.6 存储抽象层 (Storage Adapter)
 
@@ -133,7 +134,8 @@
 - 基于Hadoop FileSystem API，原生支持HDFS
 - OSS通过`hadoop-aliyun`插件或JindoFS SDK接入
 - S3通过`hadoop-aws`插件接入
-- 提供统一的`create/rename/delete/exists/list`操作
+- 提供统一的`create/read/rename/delete/exists/list`操作
+- OSS的`rename()`重写为幂等操作：若target已存在则只删source（处理OSS copy+delete非原子性）
 
 ## 三、技术选型
 
@@ -208,26 +210,28 @@
          │  达到flush条件 (行数/大小/时间)
          ▼
   ┌──────────────┐
-  │ Checkpoint   │  写入本地: {topic, partition, offsetRange, tmpFilePath}
-  │ (本地磁盘)   │
-  └──────┬───────┘
-         │
-         │  FileWriter: 序列化为Parquet/CSV
-         ▼
-  ┌──────────────┐
+  │ Phase 1      │  FileWriter: 序列化为Parquet/CSV，写入临时文件
   │ 临时文件      │  路径: {sinkPath}/_tmp/part-{node}-{partition}-{offset}.tmp
   │ (HDFS/OSS)   │
   └──────┬───────┘
          │
-         │  rename (原子操作)
+         │  Phase 2
+         ▼
+  ┌──────────────┐
+  │ Checkpoint   │  写入远端: {remoteBaseDir}/{topic}/P{n}.ckpt
+  │ (HDFS/OSS)   │  内容: {topic, partition, offsetRange, tmpFile, targetFile, nodeId}
+  │ 共享存储     │  ※ 任意节点Rebalance后均可读取
+  └──────┬───────┘
+         │
+         │  Phase 3: rename (HDFS原子 / OSS idempotent copy+delete)
          ▼
   ┌──────────────┐
   │ 正式文件      │  路径: {sinkPath}/part-{node}-P{n}-{startOffset}to{endOffset}-{ts}.snappy.parquet
   │ (HDFS/OSS)   │
   └──────┬───────┘
          │
-         │  consumer.commitSync(offsets)
-         │  删除checkpoint文件
+         │  Phase 4: consumer.commitSync(offsets)
+         │  Phase 5: 删除远端checkpoint文件
          ▼
      完成一次flush周期
 ```

@@ -41,228 +41,162 @@ consumer.commitSync(offsets);
 Phase 1: 数据序列化，写入HDFS/OSS临时文件 (_tmp目录)
     │
     ▼
-Phase 2: 将checkpoint信息写入本地磁盘
-    │     checkpoint = {topic, partition, offsetRange, tmpFile, targetFile}
+Phase 2: 将checkpoint写入HDFS/OSS（RemoteCheckpointManager）
+    │     路径: {remoteBaseDir}/{topic}/P{partition}.ckpt
+    │     内容: {topic, partition, offsetRange, tmpFile, targetFile, nodeId}
+    │     ※ 存储在共享存储上，任意节点接管后均可读取
     ▼
-Phase 3: rename临时文件 → 正式文件 (HDFS rename是原子操作)
+Phase 3: rename临时文件 → 正式文件
+    │     HDFS: 服务端原子操作
+    │     OSS:  copy + delete（非原子，见下文OSS特殊处理）
+    ▼
+Phase 4: commitSync offset到Kafka（在ConsumerWorker线程执行）
     │
     ▼
-Phase 4: commitSync offset到Kafka
-    │
-    ▼
-Phase 5: 删除本地checkpoint文件
+Phase 5: 删除HDFS/OSS上的checkpoint文件
 ```
 
 **每个Phase之间都可能crash，下面分析各crash场景的恢复策略。**
+
+### 3.1 OSS rename非原子处理
+
+OSS的`AliyunOSSFileSystem.rename()`是copy + delete，不是原子操作。如果crash发生在copy完成但delete之前，重启时target和tmp同时存在。
+
+`OssStorageAdapter`重写`rename()`以确保幂等：
+
+```java
+@Override
+public boolean rename(String srcPath, String dstPath) throws IOException {
+    // target已存在 → copy已完成，只需删除source
+    if (exists(dstPath)) {
+        delete(srcPath);
+        return true;
+    }
+    return super.rename(srcPath, dstPath);
+}
+```
 
 ## 四、Crash场景与恢复策略
 
 ### 4.1 场景分类
 
-| 编号 | Crash时机 | 数据在哪里 | HDFS状态 | Kafka Offset | 恢复策略 |
-|------|----------|-----------|---------|--------------|---------|
-| C-1 | poll后，入buffer前 | Kafka | 无文件 | 未提交 | 无需处理，自动重新poll |
-| C-2 | buffer积累中，flush前 | 内存 | 无文件 | 未提交 | 无需处理，重新从committed offset消费 |
-| C-3 | Phase 1执行中 | 部分写入tmp | 不完整tmp文件 | 未提交 | 检测到ckpt无完整tmp → 删除残留tmp → 回溯消费 |
-| C-4 | Phase 1完成, Phase 2之前 | 完整tmp文件 | 完整tmp文件 | 未提交 | 无checkpoint → 清理孤儿tmp → 重新消费 |
-| C-5 | Phase 2完成, Phase 3之前 | checkpoint + tmp | 完整tmp文件 | 未提交 | 读ckpt → 补完rename → seek到正确offset |
-| C-6 | Phase 3完成, Phase 4之前 | checkpoint + 正式文件 | 正式文件已存在 | 未提交 | 读ckpt → 发现正式文件已存在 → seek到正确offset |
-| C-7 | Phase 4完成, Phase 5之前 | 残留checkpoint | 正式文件已存在 | 已提交 | 读ckpt → 发现已完成 → 删除ckpt |
+| 编号 | Crash时机 | checkpoint状态 | HDFS状态 | Kafka Offset | 恢复策略 |
+|------|----------|--------------|---------|--------------|---------|
+| C-1 | poll后，入buffer前 | 无 | 无文件 | 未提交 | 无需处理，自动重新poll |
+| C-2 | buffer积累中，flush前 | 无 | 无文件 | 未提交 | 从committed offset重消费 |
+| C-3 | Phase 1执行中 | 无 | 不完整tmp | 未提交 | 无checkpoint → 回溯到committed offset重消费 |
+| C-4 | Phase 1完成, Phase 2之前 | 无 | 完整tmp | 未提交 | 无checkpoint → 回溯到committed offset；孤儿tmp留在_tmp目录 |
+| C-5 | Phase 2完成, Phase 3之前 | 有（远端） | 完整tmp，无target | 未提交 | 读远端ckpt → 补完rename → seek到endOffset+1 |
+| C-6 | Phase 3完成, Phase 4之前 | 有（远端） | target存在 | 未提交 | 读远端ckpt → 发现target已存在 → seek到endOffset+1 |
+| C-7 | Phase 4完成, Phase 5之前 | 有（远端） | target存在 | 已提交 | 读远端ckpt → 发现已完成 → seek到endOffset+1 → 删除ckpt |
 
-### 4.2 启动恢复流程
+### 4.2 恢复触发时机：onPartitionsAssigned
+
+恢复**不在进程启动时执行**，而是在Kafka分配分区后的`onPartitionsAssigned()`回调中执行。这保证了`consumer.seek()`在分区实际分配后才调用，且对所有节点（包括跨节点接管）均有效。
 
 ```
-进程启动
-   │
-   ▼
-扫描 ./checkpoint/ 目录
-   │
-   ├── 无checkpoint文件 ──► 正常启动，从Kafka committed offset消费
-   │
-   └── 有checkpoint文件 ──► 逐个处理
-           │
-           ▼
-      读取checkpoint内容
-           │
-           ├── HDFS正式文件已存在？
-           │      │
-           │     Yes ──► 场景C-6/C-7: 文件已落盘
-           │      │      seek到 endOffset+1
-           │      │      删除checkpoint
-           │      │
-           │     No ──► HDFS临时文件存在？
-           │             │
-           │            Yes ──► 场景C-5: tmp完整但未rename
-           │             │      执行rename: _tmp/xxx → 正式路径
-           │             │      seek到 endOffset+1
-           │             │      删除checkpoint
-           │             │
-           │            No ──► 场景C-3/C-4: 数据未完整落盘
-           │                    seek到 startOffset (回溯重新消费)
-           │                    删除checkpoint
-           │
-           ▼
-      清理HDFS上所有 _tmp/ 目录下的残留文件
-           │
-           ▼
-      恢复完成，开始正常消费循环
+Kafka触发Rebalance
+    │
+    ▼
+SafeRebalanceListener.onPartitionsAssigned(partitions)
+    │
+    ├── for each tp in partitions:
+    │       RemoteCheckpointManager.load(tp)      ← 读HDFS/OSS，任意节点均可访问
+    │           │
+    │           ├── 无checkpoint（C-1/C-2）
+    │           │      → 不seek，从Kafka committed offset消费
+    │           │
+    │           └── 有checkpoint
+    │                  │
+    │                  ├── target文件存在（C-6/C-7）
+    │                  │      → seek to endOffset+1
+    │                  │      → idempotentChecker.recordWritten(start, end)  ← 防重复写
+    │                  │
+    │                  ├── tmp文件存在（C-5）
+    │                  │      → storage.rename(tmp, target)
+    │                  │      → seek to endOffset+1
+    │                  │      → idempotentChecker.recordWritten(start, end)
+    │                  │
+    │                  └── 无文件（C-3/C-4）
+    │                         → seek to startOffset（回溯重消费）
+    │
+    └── createBuffer(tp, config)
 ```
 
-### 4.3 恢复代码设计
+### 4.3 OffsetOutOfRangeException处理
 
-```java
-public class CrashRecoveryManager {
+当checkpoint中记录的offset已被Kafka日志清理（log retention过期），`consumer.seek()`后的下次`poll()`会抛出`OffsetOutOfRangeException`。
 
-    private final Path checkpointBaseDir;  // 本地: ./checkpoint/
-    private final FileSystem hdfs;
-    private final KafkaConsumer<String, String> consumer;
+处理策略：**seek到该分区的earliest可用offset（at-least-once）**。
 
-    /**
-     * 进程启动时调用，在Consumer.poll()之前执行
-     * @return 需要seek的offset映射表
-     */
-    public Map<TopicPartition, Long> recover() {
-        Map<TopicPartition, Long> seekOffsets = new HashMap<>();
-
-        for (File ckptFile : listAllCheckpoints()) {
-            Checkpoint ckpt = Checkpoint.fromFile(ckptFile);
-            TopicPartition tp = new TopicPartition(ckpt.getTopic(), ckpt.getPartition());
-
-            try {
-                if (hdfs.exists(new Path(ckpt.getTargetFilePath()))) {
-                    // 正式文件已存在 → flush已完成，只需seek到正确位置
-                    seekOffsets.put(tp, ckpt.getEndOffset() + 1);
-                    log.info("[Recovery] 文件已落盘: {} → seek to {}", tp, ckpt.getEndOffset() + 1);
-
-                } else if (hdfs.exists(new Path(ckpt.getTmpFilePath()))) {
-                    // 临时文件存在 → 补完rename
-                    hdfs.rename(new Path(ckpt.getTmpFilePath()), new Path(ckpt.getTargetFilePath()));
-                    seekOffsets.put(tp, ckpt.getEndOffset() + 1);
-                    log.info("[Recovery] 补完rename: {} → seek to {}", tp, ckpt.getEndOffset() + 1);
-
-                } else {
-                    // 临时文件也不存在 → 数据未落盘，需要回溯
-                    seekOffsets.put(tp, ckpt.getStartOffset());
-                    log.info("[Recovery] 数据未落盘: {} → 回溯到 {}", tp, ckpt.getStartOffset());
-                }
-            } catch (IOException e) {
-                // HDFS不可用 → 保守处理，回溯到startOffset
-                seekOffsets.put(tp, ckpt.getStartOffset());
-                log.warn("[Recovery] HDFS检测失败: {} → 回溯到 {}", tp, ckpt.getStartOffset(), e);
-            }
-
-            // 删除已处理的checkpoint
-            ckptFile.delete();
-        }
-
-        // 清理HDFS上所有_tmp目录残留
-        cleanOrphanTmpFiles();
-
-        return seekOffsets;
+```
+ConsumerWorker.run() poll循环:
+    try {
+        records = consumer.poll(...)
+    } catch (OffsetOutOfRangeException e) {
+        → consumer.beginningOffsets(e.partitions())
+        → 对每个受影响分区 seek to earliest
+        → continue（下次poll从earliest开始）
     }
-
-    /**
-     * 清理所有配置路径下的_tmp目录
-     */
-    private void cleanOrphanTmpFiles() {
-        for (TopicSinkConfig config : configManager.getAllActive()) {
-            try {
-                Path tmpDir = new Path(config.getSinkPath(), "_tmp");
-                if (hdfs.exists(tmpDir)) {
-                    FileStatus[] tmpFiles = hdfs.listStatus(tmpDir);
-                    for (FileStatus f : tmpFiles) {
-                        hdfs.delete(f.getPath(), false);
-                        log.info("[Recovery] 清理残留临时文件: {}", f.getPath());
-                    }
-                }
-            } catch (IOException e) {
-                log.warn("[Recovery] 清理临时文件失败: {}", config.getSinkPath(), e);
-            }
-        }
-    }
-}
 ```
 
-## 五、HDFS/OSS 不可用容错
+重消费可能产生少量重复数据，但不丢失数据，符合At-Least-Once语义。
 
-### 5.1 重试与退避策略
+## 五、HDFS/OSS 持续不可用容错
+
+### 5.1 三级重试策略
 
 ```
 第1次失败 → 等待 2秒 → 重试
 第2次失败 → 等待 4秒 → 重试
 第3次失败 → 等待 8秒 → 重试
-第3次仍失败 → 进入降级模式
+第3次仍失败 → 视为"存储持续不可用"，进入分区暂停模式
 ```
 
-### 5.2 降级模式
+### 5.2 分区暂停 + 自动探测恢复
 
-当HDFS/OSS持续不可用时：
+当flush全部重试失败后，**不丢弃数据，不退出进程**，而是：
 
-1. **暂停消费**：调用`consumer.pause(partitions)`，停止poll该topic的数据
-2. **数据保留**：Buffer中的数据保留在内存中，不丢弃
-3. **触发告警**：发送CRITICAL级别告警
-4. **自动检测恢复**：每60秒检测HDFS是否恢复
-5. **自动恢复消费**：HDFS恢复后，先flush积压Buffer，再调用`consumer.resume(partitions)`
+1. 将失败的`TopicPartition`加入`failedFlushSignals`队列（flush线程 → consumer线程）
+2. consumer线程在下次poll前调用`drainFlushFailureSignals()`：
+   - 调用`consumer.pause(tp)`暂停该分区拉取
+   - 记入`pausedDueToFailure`集合
+3. `StorageHealthChecker`在每次poll循环中探测存储可用性（内部30秒限速）
+4. 探测成功 → `consumer.resume(pausedDueToFailure)` → 继续从last committed offset消费
 
-```java
-public class ResilientFlushExecutor {
-
-    private static final int MAX_RETRIES = 3;
-
-    public FlushResult flushWithRetry(WriteBuffer buffer) {
-        int attempt = 0;
-        while (attempt < MAX_RETRIES) {
-            try {
-                return doFlush(buffer);
-            } catch (IOException e) {
-                attempt++;
-                log.warn("Flush失败 [{}/{}], topic={}, partition={}",
-                    attempt, MAX_RETRIES, buffer.getTopic(), buffer.getPartition(), e);
-                if (attempt < MAX_RETRIES) {
-                    sleepMs(2000L * (1L << (attempt - 1)));  // 2s, 4s, 8s
-                }
-            }
-        }
-
-        // 超过重试上限: 进入降级模式
-        enterDegradedMode(buffer);
-        return FlushResult.FAILED;
-    }
-
-    private void enterDegradedMode(WriteBuffer buffer) {
-        // 暂停该分区的消费
-        Set<TopicPartition> tps = buffer.getTopicPartitions();
-        consumerPool.pausePartitions(tps);
-
-        // 触发告警
-        metrics.counter("flush_failure_total",
-            "topic", buffer.getTopic()).increment();
-        alertManager.fire(AlertLevel.CRITICAL,
-            String.format("HDFS写入失败, topic=%s, partition=%s, bufferSize=%d",
-                buffer.getTopic(), buffer.getPartition(), buffer.size()));
-
-        // 启动恢复检测定时任务
-        scheduleRecoveryCheck(buffer, tps);
-    }
-
-    private void scheduleRecoveryCheck(WriteBuffer buffer, Set<TopicPartition> tps) {
-        scheduler.scheduleAtFixedRate(() -> {
-            if (isStorageAvailable()) {
-                try {
-                    FlushResult result = doFlush(buffer);
-                    if (result.isSuccess()) {
-                        consumerPool.resumePartitions(tps);
-                        log.info("存储恢复, 自动resume消费: {}", tps);
-                        // 取消检测任务（通过返回的ScheduledFuture.cancel）
-                    }
-                } catch (Exception e) {
-                    log.debug("存储仍不可用, 继续等待...");
-                }
-            }
-        }, 60, 60, TimeUnit.SECONDS);
-    }
-}
 ```
+存储故障时机线：
+
+flush失败(3次) → consumer.pause(tp) → 停止消费
+       │
+       │  [存储恢复前]
+       │   StorageHealthChecker.probe() 每30s探测
+       │   → 失败：LOG DEBUG，继续等待
+       │
+       │  [存储恢复后]
+       ▼
+StorageHealthChecker.probe() → 成功 → LOG INFO "Storage recovered"
+       │
+       ▼
+consumer.resume(pausedPartitions) → 继续从committed offset消费
+       │
+       ├── offset仍有效 → 正常重消费 ✓
+       └── offset已过期 → OffsetOutOfRangeException → seek to earliest ✓
+```
+
+**关键保证**：暂停期间不提交任何更高的offset，确保存储恢复后Kafka能重新投递失败批次的数据。
+
+### 5.3 BackpressureController内存保护
+
+```
+max-total-bytes: 3GB
+暂停阈值: 90% (2.7GB) → canConsume() = false → 停止poll
+超限告警: > 100% → LOG WARN "CRITICAL: buffer exceeds hard limit"
+```
+
+消费线程睡眠时间随压力自适应：
+- `canConsume() = false && !isCritical()` → sleep 100ms
+- `canConsume() = false && isCritical()` → sleep 500ms（减少CPU自旋）
 
 ## 六、Graceful Shutdown（优雅关闭）
 
@@ -272,104 +206,54 @@ public class ResilientFlushExecutor {
 SIGTERM / SIGINT 信号
     │
     ▼
-1. 设置 running = false, 停止poll循环
+1. consumerPool.stopPolling()    → 设置running=false，wakeup()所有consumer
     │
     ▼
-2. 遍历所有WriteBuffer, 执行紧急flush
-    │  不管是否达到阈值，所有Buffer数据都flush到HDFS
+2. 遍历所有WriteBuffer，执行紧急flush
+    │  Phases 1-3：写tmp → 保存远端checkpoint → rename
+    │  ※ 此处不删checkpoint，留作安全网（Phase 5由commitSync后执行）
     ▼
-3. 提交所有已flush的offset
+3. consumerPool.commitAllOffsets()   → commitSync所有分区
     │
     ▼
-4. 关闭Consumer (触发LeaveGroup, Kafka快速rebalance)
+4. consumerPool.close()              → 发送LeaveGroup，触发快速Rebalance
     │
     ▼
-5. 关闭HDFS FileSystem连接
-    │
-    ▼
-6. 关闭线程池 (先shutdown, 等待30秒, 再shutdownNow)
+5. storage.close()
     │
     ▼
 进程退出
 ```
 
-```java
-@Component
-public class GracefulShutdownHook {
+## 七、幂等写入（去重）
 
-    @PreDestroy
-    public void shutdown() {
-        log.info("收到关闭信号，开始优雅关闭...");
+### 7.1 基于远端Checkpoint的去重（无listFiles开销）
 
-        // 1. 停止消费循环
-        consumerPool.stopPolling();
+**旧方案问题**：`IdempotentWriteChecker.buildIndex()`调用`listFiles(sinkPath)`扫描目录，代价随文件数线性增长，对NameNode/OSS造成压力。
 
-        // 2. flush所有buffer
-        int flushed = bufferManager.flushAll();
-        log.info("紧急flush完成, 共flush {} 个buffer", flushed);
+**新方案**：checkpoint恢复时直接填充去重索引，无需扫描目录。
 
-        // 3. 提交offset
-        consumerPool.commitAllOffsets();
+```
+onPartitionsAssigned(tp):
+    checkpoint = remoteCheckpointMgr.load(tp)
+    if checkpoint存在 && 恢复后seekTo == endOffset+1:
+        // 说明文件已写完，直接记录，不再扫描目录
+        idempotentChecker.recordWritten(tp, start, end)
 
-        // 4. 关闭consumer
-        consumerPool.close();
-
-        // 5. 关闭存储连接
-        storageAdapter.close();
-
-        // 6. 关闭线程池
-        writerPool.shutdown();
-        try {
-            if (!writerPool.awaitTermination(30, TimeUnit.SECONDS)) {
-                writerPool.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            writerPool.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-
-        log.info("优雅关闭完成");
-    }
-}
+flush前:
+    idempotentChecker.isAlreadyWritten(tp, start, end)?
+        → true:  return FlushResult.skipped()   // 跳过，不重复写
+        → false: doFlush() → recordWritten()
 ```
 
-## 七、数据去重支持
+`isAlreadyWritten()`的判断逻辑（TreeMap floorEntry）：
 
-### 7.1 幂等写入检测
+```
+writtenRanges[P0] = TreeMap{ 100→199 }
 
-利用文件名中的offset范围实现幂等检测：
-
-```java
-/**
- * 启动时扫描目标目录，构建已写入offset区间索引
- * flush前检查：如果该offset范围已有文件，跳过写入
- */
-public class IdempotentWriteChecker {
-
-    // key: TopicPartition, value: 已写入的offset区间 (startOffset → endOffset)
-    private final Map<TopicPartition, TreeMap<Long, Long>> writtenRanges = new ConcurrentHashMap<>();
-
-    public void buildIndex(String sinkPath) {
-        // 扫描目录下的parquet/csv文件，从文件名解析offset范围
-        // 文件名: part-pod01-P3-580000to582390-20260322140530.snappy.parquet
-        for (FileStatus file : hdfs.listStatus(new Path(sinkPath))) {
-            String name = file.getPath().getName();
-            OffsetRange range = OffsetRange.parseFromFileName(name);
-            if (range != null) {
-                writtenRanges
-                    .computeIfAbsent(range.topicPartition(), k -> new TreeMap<>())
-                    .put(range.startOffset(), range.endOffset());
-            }
-        }
-    }
-
-    public boolean isAlreadyWritten(TopicPartition tp, long startOffset, long endOffset) {
-        TreeMap<Long, Long> ranges = writtenRanges.get(tp);
-        if (ranges == null) return false;
-        Map.Entry<Long, Long> floor = ranges.floorEntry(startOffset);
-        return floor != null && floor.getValue() >= endOffset;
-    }
-}
+查询[100, 199]: floorEntry(100)=entry(100,199), 199≥199 → true  跳过 ✓
+查询[120, 170]: floorEntry(120)=entry(100,199), 199≥170 → true  跳过 ✓
+查询[100, 250]: floorEntry(100)=entry(100,199), 199≥250 → false 写入 ✓
 ```
 
 ### 7.2 下游去重建议

@@ -7,6 +7,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,11 +33,24 @@ public class HadoopStorageAdapter implements StorageAdapter {
         this.fs = fs;
     }
 
+    public Configuration getConf() {
+        return fs.getConf();
+    }
+
+    public FileSystem getFileSystem() {
+        return fs;
+    }
+
     @Override
     public OutputStream create(String path) throws IOException {
         Path p = new Path(path);
         fs.mkdirs(p.getParent());
         return fs.create(p, true);   // overwrite=true for tmp files
+    }
+
+    @Override
+    public InputStream read(String path) throws IOException {
+        return fs.open(new Path(path));
     }
 
     @Override

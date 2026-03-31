@@ -64,14 +64,4 @@ public class WriteBufferManager {
         return total;
     }
 
-    public void updateFlushPolicy(String topic, TopicSinkConfig newConfig) {
-        // For flush-policy-only changes (no schema/path change), recreate buffers with new config
-        for (Map.Entry<TopicPartition, DoubleWriteBuffer> entry : buffers.entrySet()) {
-            if (entry.getKey().topic().equals(topic)) {
-                DoubleWriteBuffer old = entry.getValue();
-                DoubleWriteBuffer updated = new DoubleWriteBuffer(entry.getKey(), newConfig);
-                buffers.put(entry.getKey(), updated);
-            }
-        }
-    }
 }

@@ -4,9 +4,10 @@ import com.lakewriter.common.model.TopicSinkConfig;
 import com.lakewriter.worker.buffer.DoubleWriteBuffer;
 import com.lakewriter.worker.buffer.WriteBuffer;
 import com.lakewriter.worker.buffer.WriteBufferManager;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.config.TopicMatcher;
 import com.lakewriter.worker.node.NodeIdentity;
+import com.lakewriter.worker.storage.StorageHealthChecker;
 import com.lakewriter.worker.writer.FlushExecutor;
 import com.lakewriter.worker.writer.FlushResult;
 import lombok.extern.slf4j.Slf4j;
@@ -14,11 +15,15 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.common.TopicPartition;
 
 import java.time.Duration;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 
@@ -44,14 +49,28 @@ public class ConsumerWorker implements Runnable {
     private final FlushExecutor flushExecutor;
     private final TopicMatcher topicMatcher;
     private final NodeIdentity nodeIdentity;
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final ExecutorService flushPool;
+    private final StorageHealthChecker storageHealthChecker;
 
     /**
      * Queue of flush results waiting for commitSync on the consumer thread.
      * Flush threads post results here; the poll loop drains and commits.
      */
     private final ConcurrentLinkedQueue<PendingCommit> pendingCommits = new ConcurrentLinkedQueue<>();
+
+    /**
+     * Cross-thread signal: flush thread enqueues a partition when all retries are exhausted.
+     * Consumer thread drains this queue before each poll() and moves entries to pausedDueToFailure.
+     */
+    private final ConcurrentLinkedQueue<TopicPartition> failedFlushSignals = new ConcurrentLinkedQueue<>();
+
+    /**
+     * Partitions currently paused because of a permanent flush failure.
+     * Accessed only on the consumer thread — no synchronization needed.
+     * When StorageHealthChecker.probe() returns true, all entries are resumed.
+     */
+    private final Set<TopicPartition> pausedDueToFailure = new HashSet<>();
 
     private volatile boolean running = true;
 
@@ -61,16 +80,18 @@ public class ConsumerWorker implements Runnable {
                            FlushExecutor flushExecutor,
                            TopicMatcher topicMatcher,
                            NodeIdentity nodeIdentity,
-                           CheckpointManager checkpointMgr,
-                           ExecutorService flushPool) {
-        this.consumer       = consumer;
-        this.dispatcher     = dispatcher;
-        this.bufferManager  = bufferManager;
-        this.flushExecutor  = flushExecutor;
-        this.topicMatcher   = topicMatcher;
-        this.nodeIdentity   = nodeIdentity;
-        this.checkpointMgr  = checkpointMgr;
-        this.flushPool      = flushPool;
+                           RemoteCheckpointManager checkpointMgr,
+                           ExecutorService flushPool,
+                           StorageHealthChecker storageHealthChecker) {
+        this.consumer             = consumer;
+        this.dispatcher           = dispatcher;
+        this.bufferManager        = bufferManager;
+        this.flushExecutor        = flushExecutor;
+        this.topicMatcher         = topicMatcher;
+        this.nodeIdentity         = nodeIdentity;
+        this.checkpointMgr        = checkpointMgr;
+        this.flushPool            = flushPool;
+        this.storageHealthChecker = storageHealthChecker;
     }
 
     @Override
@@ -81,13 +102,32 @@ public class ConsumerWorker implements Runnable {
                 // Phase 4+5: process any completed flush results (commit + delete checkpoint)
                 drainPendingCommits();
 
-                // Backpressure: pause polling if buffer is full
+                // Move flush-failure signals into pausedDueToFailure and call consumer.pause().
+                // Must run before poll() so no new records are fetched for failing partitions.
+                drainFlushFailureSignals();
+
+                // If any partitions are paused due to storage failure, probe for recovery.
+                // When storage comes back, resume them; if their offset expired, the
+                // OffsetOutOfRangeException handler below will seek to earliest.
+                checkStorageRecovery();
+
+                // Backpressure: slow down polling if buffer is approaching the memory limit
                 if (!bufferManager.getBackpressure().canConsume()) {
-                    try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+                    long sleepMs = bufferManager.getBackpressure().isCritical() ? 500 : 100;
+                    try { Thread.sleep(sleepMs); } catch (InterruptedException e) { break; }
                     continue;
                 }
 
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+                ConsumerRecords<String, String> records;
+                try {
+                    records = consumer.poll(Duration.ofMillis(500));
+                } catch (OffsetOutOfRangeException e) {
+                    // Checkpoint recovery (or post-pause resume) seeked to an offset Kafka has
+                    // already pruned. Seek to earliest to avoid a permanent stall.
+                    // At-least-once: re-consuming old data is safe; skipping is not.
+                    handleOffsetOutOfRange(e);
+                    continue;
+                }
                 for (ConsumerRecord<String, String> record : records) {
                     dispatcher.dispatch(record);
                 }
@@ -110,6 +150,18 @@ public class ConsumerWorker implements Runnable {
         PendingCommit pending;
         while ((pending = pendingCommits.poll()) != null) {
             final PendingCommit p = pending;
+
+            // Skip commits for partitions no longer assigned to this consumer (revoked during
+            // rebalance). Attempting commitSync on a revoked partition throws an exception and
+            // would stop the drain loop, blocking commits for all still-active partitions.
+            // The remote checkpoint left by the flush will allow the new owner to recover.
+            if (!consumer.assignment().contains(p.tp)) {
+                log.debug("[Commit] Skipping commit for revoked partition {} — new owner will recover via checkpoint", p.tp);
+                bufferManager.getBackpressure().release(p.toFlush.getTotalBytes());
+                p.dbuf.recycleFlushed(p.toFlush);
+                continue;
+            }
+
             try {
                 // Phase 4: commitSync (safe — on consumer thread)
                 Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
@@ -140,6 +192,66 @@ public class ConsumerWorker implements Runnable {
     }
 
     /**
+     * Seek affected partitions to their earliest available Kafka offset.
+     * Called when the offset stored in a checkpoint (or the position after a long pause)
+     * has been pruned by Kafka log retention.
+     * At-least-once: re-consuming old data is safe; skipping is not.
+     */
+    private void handleOffsetOutOfRange(OffsetOutOfRangeException e) {
+        log.warn("[Consumer] OffsetOutOfRange: offsets pruned by Kafka. " +
+                 "Seeking to earliest to avoid permanent stall. Partitions: {}", e.partitions());
+        Map<TopicPartition, Long> earliest = consumer.beginningOffsets(e.partitions());
+        for (Map.Entry<TopicPartition, Long> entry : earliest.entrySet()) {
+            log.warn("[Consumer] {} → seek to earliest={}", entry.getKey(), entry.getValue());
+            consumer.seek(entry.getKey(), entry.getValue());
+        }
+    }
+
+    /**
+     * Drain flush-failure signals posted by flush threads and pause the affected partitions.
+     * Must run on the consumer thread — KafkaConsumer.pause() is not thread-safe.
+     *
+     * Pausing prevents subsequent successful flushes from committing offsets that skip over
+     * the failed range.  Because the failed batch's offset was never committed, Kafka still
+     * holds those records; they will be re-delivered once storage recovers and we resume.
+     */
+    private void drainFlushFailureSignals() {
+        TopicPartition tp;
+        while ((tp = failedFlushSignals.poll()) != null) {
+            if (pausedDueToFailure.add(tp)) {
+                consumer.pause(Collections.singleton(tp));
+                log.error("[Consumer] Partition {} PAUSED — permanent flush failure. " +
+                          "Will auto-resume when storage recovers.", tp);
+            }
+        }
+    }
+
+    /**
+     * When partitions are paused due to a storage failure, periodically probe the storage.
+     * StorageHealthChecker is rate-limited internally, so this is safe to call every iteration.
+     *
+     * On recovery:
+     *   consumer.resume() → next poll fetches from last committed offset.
+     *   If that offset expired while storage was down, OffsetOutOfRangeException is caught
+     *   above and the partition seeks to the earliest available offset (at-least-once).
+     */
+    private void checkStorageRecovery() {
+        if (pausedDueToFailure.isEmpty()) return;
+        if (!storageHealthChecker.probe()) return;
+
+        // Intersect with consumer.paused() to avoid resuming revoked partitions
+        Set<TopicPartition> currentlyPaused = consumer.paused();
+        Set<TopicPartition> toResume = new HashSet<>(pausedDueToFailure);
+        toResume.retainAll(currentlyPaused);
+
+        if (!toResume.isEmpty()) {
+            consumer.resume(toResume);
+            log.info("[Consumer] Storage recovered — resuming {} partition(s): {}", toResume.size(), toResume);
+        }
+        pausedDueToFailure.clear();
+    }
+
+    /**
      * Check all assigned partitions for flush thresholds.
      * Flush is submitted to a separate thread pool; result is queued back to consumer thread.
      */
@@ -147,6 +259,15 @@ public class ConsumerWorker implements Runnable {
         for (TopicPartition tp : consumer.assignment()) {
             DoubleWriteBuffer dbuf = bufferManager.getBuffer(tp);
             if (dbuf == null || !dbuf.getActiveBuffer().shouldFlush()) continue;
+
+            // Guard: skip if a flush is already in flight for this partition.
+            // If we swapped again while standby == null, the two flush threads would race
+            // to add PendingCommits in completion order (not offset order), causing the
+            // consumer thread to commit offsets out of sequence for the same partition.
+            if (dbuf.isFlushInProgress()) {
+                log.debug("[Flush] Skipping trigger for {} — previous flush still in progress", tp);
+                continue;
+            }
 
             TopicSinkConfig config = topicMatcher.match(tp.topic());
             if (config == null) continue;
@@ -164,9 +285,14 @@ public class ConsumerWorker implements Runnable {
                     // Skipped flush (empty or already written) — just recycle the buffer
                     dbuf.recycleFlushed(toFlush);
                 } else {
-                    log.error("[Flush] Failed for {}: {}", tpFinal, result.getErrorMessage());
-                    // Recycle buffer so standby is available; data lost in this batch
-                    // but checkpoint was saved — on restart recovery will re-seek
+                    log.error("[Flush] Permanent failure for {} offsets {}-{}: {}. " +
+                              "Partition will be paused; Kafka will re-deliver from last committed offset on restart.",
+                              tpFinal, toFlush.getStartOffset(), toFlush.getLastOffset(),
+                              result.getErrorMessage());
+                    // Signal consumer thread to pause this partition before the next poll().
+                    // This prevents a later successful flush from committing an offset that
+                    // jumps over the failed range, which would cause permanent data loss.
+                    failedFlushSignals.add(tpFinal);
                     dbuf.recycleFlushed(toFlush);
                 }
             });

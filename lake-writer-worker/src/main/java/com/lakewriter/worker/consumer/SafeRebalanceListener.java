@@ -5,8 +5,9 @@ import com.lakewriter.worker.buffer.DoubleWriteBuffer;
 import com.lakewriter.worker.buffer.WriteBuffer;
 import com.lakewriter.worker.buffer.WriteBufferManager;
 import com.lakewriter.worker.checkpoint.Checkpoint;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
 import com.lakewriter.worker.checkpoint.CrashRecoveryManager;
+import com.lakewriter.worker.checkpoint.IdempotentWriteChecker;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.config.TopicMatcher;
 import com.lakewriter.worker.node.NodeIdentity;
 import com.lakewriter.worker.writer.FlushExecutor;
@@ -32,27 +33,33 @@ import java.util.Optional;
 public class SafeRebalanceListener implements ConsumerRebalanceListener {
 
     private final WriteBufferManager bufferManager;
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final CrashRecoveryManager recoveryMgr;
+    private final IdempotentWriteChecker idempotentChecker;
     private final FlushExecutor flushExecutor;
     private final TopicMatcher topicMatcher;
     private final NodeIdentity nodeIdentity;
     private final KafkaConsumer<String, String> consumer;
+    private final KafkaConsumerPool pool;
 
     public SafeRebalanceListener(WriteBufferManager bufferManager,
-                                  CheckpointManager checkpointMgr,
+                                  RemoteCheckpointManager checkpointMgr,
                                   CrashRecoveryManager recoveryMgr,
+                                  IdempotentWriteChecker idempotentChecker,
                                   FlushExecutor flushExecutor,
                                   TopicMatcher topicMatcher,
                                   NodeIdentity nodeIdentity,
-                                  KafkaConsumer<String, String> consumer) {
-        this.bufferManager = bufferManager;
-        this.checkpointMgr = checkpointMgr;
-        this.recoveryMgr   = recoveryMgr;
-        this.flushExecutor = flushExecutor;
-        this.topicMatcher  = topicMatcher;
-        this.nodeIdentity  = nodeIdentity;
-        this.consumer      = consumer;
+                                  KafkaConsumer<String, String> consumer,
+                                  KafkaConsumerPool pool) {
+        this.bufferManager    = bufferManager;
+        this.checkpointMgr    = checkpointMgr;
+        this.recoveryMgr      = recoveryMgr;
+        this.idempotentChecker = idempotentChecker;
+        this.flushExecutor    = flushExecutor;
+        this.topicMatcher     = topicMatcher;
+        this.nodeIdentity     = nodeIdentity;
+        this.consumer         = consumer;
+        this.pool             = pool;
     }
 
     /**
@@ -91,7 +98,7 @@ public class SafeRebalanceListener implements ConsumerRebalanceListener {
                 } else {
                     failed++;
                     log.warn("[Rebalance] Flush failed for {}: {}", tp, result.getErrorMessage());
-                    // Leave checkpoint on disk — new partition owner will recover via onPartitionsAssigned
+                    // Leave checkpoint on remote storage — new partition owner will recover via onPartitionsAssigned
                 }
             } catch (Exception e) {
                 failed++;
@@ -102,10 +109,16 @@ public class SafeRebalanceListener implements ConsumerRebalanceListener {
 
         log.info("[Rebalance] Revoke done: success={}, failed={}, elapsed={}ms",
             success, failed, System.currentTimeMillis() - start);
+        pool.onPartitionsRevoked(partitions);
     }
 
     /**
-     * Called after partitions are assigned — check for crash checkpoints, create buffers.
+     * Called after partitions are assigned — load remote checkpoint, recover seek offset,
+     * populate idempotent checker, and create write buffer.
+     *
+     * Remote checkpoints are visible to any node, so crash recovery now works across nodes.
+     * If recovery determines the flush completed (C-5/C-6/C-7), recordWritten() is called
+     * so the idempotent checker prevents a duplicate write without any listFiles() scan.
      */
     @Override
     public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
@@ -113,12 +126,22 @@ public class SafeRebalanceListener implements ConsumerRebalanceListener {
         log.info("[Rebalance] Assigned {} partitions: {}", partitions.size(), partitions);
 
         for (TopicPartition tp : partitions) {
-            // Check for leftover checkpoint (this node previously owned this partition)
+            // Load checkpoint from HDFS/OSS — works for any node, not just the original owner
             Optional<Checkpoint> ckpt = checkpointMgr.load(tp);
             if (ckpt.isPresent()) {
                 long seekTo = recoveryMgr.recoverPartition(ckpt.get());
                 consumer.seek(tp, seekTo);
-                log.info("[Rebalance] Recovered checkpoint for {} → seek to {}", tp, seekTo);
+                log.info("[Rebalance] Recovered remote checkpoint for {} → seek to {}", tp, seekTo);
+
+                // If the flush completed (target file exists), the offset range is already on
+                // HDFS/OSS. Register it in the idempotent checker so any re-consume of the same
+                // range is skipped without an expensive listFiles() scan.
+                if (seekTo == ckpt.get().getEndOffset() + 1) {
+                    idempotentChecker.recordWritten(tp,
+                        ckpt.get().getStartOffset(), ckpt.get().getEndOffset());
+                    log.debug("[Rebalance] Registered written range {}-{} for {} in idempotent checker",
+                        ckpt.get().getStartOffset(), ckpt.get().getEndOffset(), tp);
+                }
             }
 
             // Create buffer for the new partition
@@ -127,5 +150,6 @@ public class SafeRebalanceListener implements ConsumerRebalanceListener {
                 bufferManager.createBuffer(tp, config);
             }
         }
+        pool.onPartitionsAssigned(partitions);
     }
 }

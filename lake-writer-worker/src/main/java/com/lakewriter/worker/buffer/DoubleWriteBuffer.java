@@ -28,8 +28,8 @@ public class DoubleWriteBuffer {
     }
 
     /** Consumer thread appends to active buffer — no lock needed (single writer) */
-    public void append(Object[] row, long offset, long estimatedBytes) {
-        active.append(row, offset, estimatedBytes);
+    public void append(Object[] row, long offset, long estimatedBytes, long recordTimestampMs) {
+        active.append(row, offset, estimatedBytes, recordTimestampMs);
     }
 
     public WriteBuffer getActiveBuffer() {
@@ -50,6 +50,21 @@ public class DoubleWriteBuffer {
             active  = (standby != null) ? standby : new WriteBuffer(topicPartition, config);
             standby = null;
             return toFlush;
+        } finally {
+            swapLock.unlock();
+        }
+    }
+
+    /**
+     * Returns true when a flush is already in progress for this partition.
+     * After swapForFlush(), standby is set to null until recycleFlushed() returns it.
+     * Callers should skip triggering a second flush while one is in flight to prevent
+     * two concurrent flushes from committing offsets out of order.
+     */
+    public boolean isFlushInProgress() {
+        swapLock.lock();
+        try {
+            return standby == null;
         } finally {
             swapLock.unlock();
         }

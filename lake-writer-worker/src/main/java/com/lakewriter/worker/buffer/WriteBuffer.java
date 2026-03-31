@@ -23,6 +23,9 @@ public class WriteBuffer {
     @Getter private long lastOffset  = -1;
     @Getter private long totalBytes  = 0;
 
+    /** Timestamp (epoch ms) of the first Kafka record in this buffer — used for path date resolution. */
+    @Getter private long firstRecordTimestampMs = -1;
+
     private long createdAtMs = System.currentTimeMillis();
 
     public WriteBuffer(TopicPartition topicPartition, TopicSinkConfig config) {
@@ -30,9 +33,12 @@ public class WriteBuffer {
         this.config = config;
     }
 
-    public void append(Object[] row, long offset, long estimatedBytes) {
+    public void append(Object[] row, long offset, long estimatedBytes, long recordTimestampMs) {
         rows.add(row);
-        if (startOffset == -1) startOffset = offset;
+        if (startOffset == -1) {
+            startOffset = offset;
+            firstRecordTimestampMs = recordTimestampMs;
+        }
         lastOffset = offset;
         totalBytes += estimatedBytes;
     }
@@ -63,6 +69,7 @@ public class WriteBuffer {
         startOffset = -1;
         lastOffset  = -1;
         totalBytes  = 0;
+        firstRecordTimestampMs = -1;
         createdAtMs = System.currentTimeMillis();
     }
 }

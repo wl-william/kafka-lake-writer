@@ -1,5 +1,5 @@
 server:
-  port: 8081   # only used by actuator
+  port: 9081   # only used by actuator
 
 spring:
   application:
@@ -10,8 +10,8 @@ spring:
     web-application-type: servlet
   datasource:
     url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DB:lake_writer}?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
-    username: ${MYSQL_USER:root}
-    password: ${MYSQL_PASSWORD:root}
+    username: ${MYSQL_USER}
+    password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 3       # worker only needs: config polling + heartbeat + recovery
@@ -23,7 +23,7 @@ spring:
     show-sql: false
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.MySQL8Dialect
+        dialect: org.hibernate.dialect.MySQL57Dialect
 
 # ===== Kafka Consumer =====
 lake-writer:
@@ -52,6 +52,11 @@ lake-writer:
       access-key-id: ${OSS_ACCESS_KEY:}
       access-key-secret: ${OSS_SECRET_KEY:}
       bucket: ${OSS_BUCKET:}
+    # Health probe: used to detect storage recovery after permanent flush failure.
+    # probe-path: a root-relative path that always exists (e.g. "/" for HDFS, "/" for OSS bucket root).
+    # probe-interval-sec: how often to re-probe while partitions are paused. 30s is a safe default.
+    probe-path: ${STORAGE_PROBE_PATH:/}
+    probe-interval-sec: ${STORAGE_PROBE_INTERVAL_SEC:30}
 
   # ===== Buffer =====
   buffer:
@@ -68,8 +73,12 @@ lake-writer:
     interval-sec: 15
 
   # ===== Checkpoint =====
+  # Checkpoints are stored on HDFS/OSS so any node can recover after partition rebalance.
+  # Use a dedicated directory separate from data files (not date-partitioned).
+  # HDFS example:  hdfs://namenode:8020/lake-writer-checkpoints
+  # OSS example:   oss://my-bucket/lake-writer-checkpoints
   checkpoint:
-    dir: ${CHECKPOINT_DIR:./checkpoint}
+    remote-dir: ${CHECKPOINT_REMOTE_DIR:}
 
   # ===== Node identity =====
   node:
@@ -78,7 +87,7 @@ lake-writer:
 # Actuator — expose health + prometheus only
 management:
   server:
-    port: 8081
+    port: 9081
   endpoints:
     web:
       exposure:
@@ -89,7 +98,7 @@ management:
       node: ${POD_NAME:${HOSTNAME:unknown}}
   endpoint:
     health:
-      show-details: always
+      show-details: when_authorized
 
 logging:
   level:

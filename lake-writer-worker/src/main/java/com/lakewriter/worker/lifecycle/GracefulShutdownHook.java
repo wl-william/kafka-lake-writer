@@ -3,16 +3,18 @@ package com.lakewriter.worker.lifecycle;
 import com.lakewriter.worker.buffer.DoubleWriteBuffer;
 import com.lakewriter.worker.buffer.WriteBuffer;
 import com.lakewriter.worker.buffer.WriteBufferManager;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.consumer.KafkaConsumerPool;
 import com.lakewriter.worker.node.NodeIdentity;
 import com.lakewriter.worker.storage.StorageAdapter;
 import com.lakewriter.worker.writer.FlushExecutor;
 import com.lakewriter.worker.writer.FlushResult;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.TopicPartition;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PreDestroy;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -33,14 +35,14 @@ public class GracefulShutdownHook {
     private final KafkaConsumerPool consumerPool;
     private final WriteBufferManager bufferManager;
     private final FlushExecutor flushExecutor;
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final NodeIdentity nodeIdentity;
     private final StorageAdapter storage;
 
     public GracefulShutdownHook(KafkaConsumerPool consumerPool,
                                  WriteBufferManager bufferManager,
                                  FlushExecutor flushExecutor,
-                                 CheckpointManager checkpointMgr,
+                                 RemoteCheckpointManager checkpointMgr,
                                  NodeIdentity nodeIdentity,
                                  StorageAdapter storage) {
         this.consumerPool  = consumerPool;
@@ -59,20 +61,22 @@ public class GracefulShutdownHook {
         log.info("[Shutdown] Step 1: Stopping consumer poll loops...");
         consumerPool.stopPolling();
 
-        // Step 2: flush all remaining buffers
+        // Step 2: flush all remaining buffers (Phase 1-3)
+        // Collect successfully flushed partitions for Phase 5 after commit.
         log.info("[Shutdown] Step 2: Flushing all buffers...");
         int flushed = 0;
+        List<TopicPartition> flushedPartitions = new ArrayList<>();
         List<DoubleWriteBuffer> all = bufferManager.getAllBuffers();
         for (DoubleWriteBuffer dbuf : all) {
             WriteBuffer toFlush = dbuf.swapForFlush();
             if (!toFlush.isEmpty()) {
                 try {
-                    flushExecutor.flush(
+                    FlushResult result = flushExecutor.flush(
                         toFlush, toFlush.getConfig().parseSchema(), nodeIdentity.getNodeId());
-                    // Do NOT delete checkpoint here — Phase 5 must wait until after
-                    // commitAllOffsets (Phase 4) in Step 3. Checkpoints are left on disk
-                    // as a safety net; crash recovery will handle them on restart.
-                    flushed++;
+                    if (result.isSuccess() && result.getTargetFilePath() != null) {
+                        flushedPartitions.add(toFlush.getTopicPartition());
+                        flushed++;
+                    }
                 } catch (Exception e) {
                     log.error("[Shutdown] Emergency flush failed for {}: {}",
                         toFlush.getTopicPartition(), e.getMessage());
@@ -81,12 +85,20 @@ public class GracefulShutdownHook {
         }
         log.info("[Shutdown] Step 2: Flushed {} buffers", flushed);
 
-        // Step 3: commit all offsets
+        // Step 3: commit all offsets (Phase 4)
         log.info("[Shutdown] Step 3: Committing offsets...");
         try {
             consumerPool.commitAllOffsets();
         } catch (Exception e) {
             log.warn("[Shutdown] Offset commit error: {}", e.getMessage());
+        }
+
+        // Phase 5: delete remote checkpoints for partitions we successfully flushed and committed.
+        // Without this, the next owner (after rebalance) would find stale checkpoints and
+        // perform unnecessary crash recovery, seeking to endOffset+1 instead of continuing normally.
+        log.info("[Shutdown] Phase 5: Deleting {} remote checkpoint(s)...", flushedPartitions.size());
+        for (TopicPartition tp : flushedPartitions) {
+            checkpointMgr.delete(tp);
         }
 
         // Step 4: close consumers (sends LeaveGroup → fast Rebalance on remaining nodes)

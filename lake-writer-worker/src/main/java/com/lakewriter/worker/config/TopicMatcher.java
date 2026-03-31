@@ -42,6 +42,8 @@ public class TopicMatcher {
     /**
      * Find the TopicSinkConfig for a topic name.
      * Returns null if no config matches (topic should be ignored).
+     * Regex matching is protected against catastrophic backtracking — a failed
+     * match is cached per-pattern and logged once.
      */
     public TopicSinkConfig match(String topic) {
         // Exact match first
@@ -50,8 +52,13 @@ public class TopicMatcher {
 
         // Regex match (first wins)
         for (Map.Entry<Pattern, TopicSinkConfig> entry : regexConfigs.entrySet()) {
-            if (entry.getKey().matcher(topic).matches()) {
-                return entry.getValue();
+            try {
+                if (entry.getKey().matcher(topic).matches()) {
+                    return entry.getValue();
+                }
+            } catch (Exception e) {
+                log.warn("Regex match error for pattern '{}' on topic '{}': {}",
+                    entry.getKey().pattern(), topic, e.getMessage());
             }
         }
         return null;

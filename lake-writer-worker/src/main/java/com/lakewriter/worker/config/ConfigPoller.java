@@ -127,16 +127,14 @@ public class ConfigPoller {
     }
 
     private void handleOtherChanged(TopicSinkConfig oldConfig, TopicSinkConfig newConfig) {
-        boolean pathOrFormatChanged = !safeEquals(oldConfig.getSinkPath(), newConfig.getSinkPath())
-            || !safeEquals(oldConfig.getSinkFormat(), newConfig.getSinkFormat());
-
-        if (pathOrFormatChanged) {
-            handleSchemaChanged(oldConfig, newConfig);  // same process: flush + rebuild
-        } else {
-            // Flush threshold change only — update buffer config
-            bufferManager.updateFlushPolicy(newConfig.getTopicName(), newConfig);
-        }
-        log.info("[ConfigSync] Config updated: topic={}, pathChanged={}", newConfig.getTopicName(), pathOrFormatChanged);
+        // Always flush existing buffer data before applying the new config.
+        // Even a flush-threshold-only change must not silently discard in-memory rows:
+        // if we replaced the DoubleWriteBuffer object directly, any accumulated data in the
+        // old buffer would be lost (no offset committed, no file written).
+        // Reusing handleSchemaChanged() — flush with current schema, recreate with new config —
+        // is safe for all change types and eliminates the data-loss path.
+        handleSchemaChanged(oldConfig, newConfig);
+        log.info("[ConfigSync] Config updated (flush+rebuild): topic={}", newConfig.getTopicName());
     }
 
     private static boolean safeEquals(String a, String b) {

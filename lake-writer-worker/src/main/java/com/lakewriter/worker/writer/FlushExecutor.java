@@ -4,8 +4,8 @@ import com.lakewriter.common.model.SchemaDefinition;
 import com.lakewriter.common.model.TopicSinkConfig;
 import com.lakewriter.worker.buffer.WriteBuffer;
 import com.lakewriter.worker.checkpoint.Checkpoint;
-import com.lakewriter.worker.checkpoint.CheckpointManager;
 import com.lakewriter.worker.checkpoint.IdempotentWriteChecker;
+import com.lakewriter.worker.checkpoint.RemoteCheckpointManager;
 import com.lakewriter.worker.schema.PathResolver;
 import com.lakewriter.worker.storage.StorageAdapter;
 import lombok.extern.slf4j.Slf4j;
@@ -18,9 +18,9 @@ import java.util.List;
 
 /**
  * Executes the 5-phase commit flush:
- *   Phase 1: Write data to tmp file on HDFS
- *   Phase 2: Write checkpoint to local disk
- *   Phase 3: Atomic rename tmp → target (HDFS rename is atomic)
+ *   Phase 1: Write data to tmp file on HDFS/OSS
+ *   Phase 2: Write checkpoint to HDFS/OSS (RemoteCheckpointManager — shared, any node can read)
+ *   Phase 3: Atomic rename tmp → target (HDFS: server-side atomic; OSS: idempotent copy+delete)
  *   Phase 4: commitSync offset (done by caller after return)
  *   Phase 5: Delete checkpoint file
  *
@@ -33,11 +33,11 @@ public class FlushExecutor {
     private static final int MAX_RETRIES = 3;
 
     private final StorageAdapter storage;
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final FileWriterFactory writerFactory;
     private final IdempotentWriteChecker idempotentChecker;
 
-    public FlushExecutor(StorageAdapter storage, CheckpointManager checkpointMgr,
+    public FlushExecutor(StorageAdapter storage, RemoteCheckpointManager checkpointMgr,
                          IdempotentWriteChecker idempotentChecker) {
         this.storage = storage;
         this.checkpointMgr = checkpointMgr;
@@ -92,8 +92,11 @@ public class FlushExecutor {
         TopicPartition tp = buffer.getTopicPartition();
         TopicSinkConfig config = buffer.getConfig();
 
-        // Resolve path template (e.g. /hdfs/data/orders/2026-03-22)
-        String resolvedPath = PathResolver.resolve(config.getSinkPath(), tp.topic(), null);
+        // Resolve path template using the first record's Kafka timestamp, not system time.
+        // This ensures data entering Kafka at 2026-03-27 23:59 writes to the 03-27 partition,
+        // even if the flush happens after midnight.
+        long recordTimestamp = buffer.getFirstRecordTimestampMs();
+        String resolvedPath = PathResolver.resolve(config.getSinkPath(), tp.topic(), recordTimestamp, null);
 
         // Build file names
         String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
@@ -106,6 +109,13 @@ public class FlushExecutor {
 
         List<Object[]> rows = buffer.drainRows();
 
+        // Ensure _tmp directory exists (ParquetWriter doesn't auto-create parent dirs)
+        String tmpDir = tmpPath.substring(0, tmpPath.lastIndexOf('/'));
+        boolean mkdirsResult = storage.mkdirs(tmpDir);
+        if (!mkdirsResult && !storage.exists(tmpDir)) {
+            throw new IOException("Failed to create tmp dir: " + tmpDir);
+        }
+
         // Phase 1: write to tmp file
         try (FormatWriter writer = writerFactory.create(config)) {
             writer.open(tmpPath, schema, config);
@@ -113,7 +123,7 @@ public class FlushExecutor {
         }
         log.debug("[Flush] Phase 1 complete: wrote {} rows to {}", rows.size(), tmpPath);
 
-        // Phase 2: write checkpoint to local disk
+        // Phase 2: write checkpoint to HDFS/OSS (RemoteCheckpointManager)
         Checkpoint ckpt = new Checkpoint(tp.topic(), tp.partition(),
             buffer.getStartOffset(), buffer.getLastOffset(), rows.size(),
             tmpPath, targetPath, nodeId);
@@ -121,7 +131,9 @@ public class FlushExecutor {
         log.debug("[Flush] Phase 2 complete: checkpoint saved");
 
         // Phase 3: atomic rename
-        storage.rename(tmpPath, targetPath);
+        if (!storage.rename(tmpPath, targetPath)) {
+            throw new IOException("Failed to rename tmp file " + tmpPath + " to " + targetPath);
+        }
         log.info("[Flush] Phase 3 complete (Phases 1-3 done): renamed to {}", targetPath);
 
         // Phase 4 (commitSync) and Phase 5 (delete checkpoint) are done by the caller

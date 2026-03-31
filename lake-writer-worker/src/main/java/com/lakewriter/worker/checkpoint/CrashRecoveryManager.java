@@ -10,7 +10,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Handles all 7 crash scenarios by inspecting checkpoint files and HDFS state at startup.
+ * Handles all 7 crash scenarios by inspecting checkpoint files and HDFS/OSS state.
+ *
+ * Checkpoints are now stored on HDFS/OSS (RemoteCheckpointManager), making them visible
+ * to any node that receives the partition after a rebalance — not just the original owner.
  *
  * C-1/C-2: No checkpoint → consumer restarts from committed offset automatically
  * C-3/C-4: Checkpoint + no HDFS files → roll back to startOffset
@@ -20,15 +23,10 @@ import java.util.Map;
 @Slf4j
 public class CrashRecoveryManager {
 
-    private final CheckpointManager checkpointMgr;
+    private final RemoteCheckpointManager checkpointMgr;
     private final StorageAdapter storage;
 
-    public CrashRecoveryManager(String checkpointDir, StorageAdapter storage) {
-        this.checkpointMgr = new CheckpointManager(checkpointDir);
-        this.storage = storage;
-    }
-
-    public CrashRecoveryManager(CheckpointManager checkpointMgr, StorageAdapter storage) {
+    public CrashRecoveryManager(RemoteCheckpointManager checkpointMgr, StorageAdapter storage) {
         this.checkpointMgr = checkpointMgr;
         this.storage = storage;
     }
